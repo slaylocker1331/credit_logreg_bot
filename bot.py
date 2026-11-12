@@ -1,372 +1,260 @@
 """
-Telegram bot for credit approval prediction
-Uses trained logistic regression model
+Telegram-бот для прогноза одобрения кредита на основе логистической регрессии
 """
 import logging
-import pickle
-import pandas as pd
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
-from telegram.error import TelegramError
+import math
+import os
+import re
+import warnings
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler,
+    MessageHandler, filters,
 )
+from telegram.warnings import PTBUserWarning
+
+from model import (
+    DEFAULT_ON_FILE, HOME_OWNERSHIP, LOAN_GRADE, LOAN_INTENT, MODEL_PATH, load_model, predict_risk,
+)
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Mixing message and callback handlers in one conversation is intended here
+warnings.filterwarnings('ignore', message=r".*CallbackQueryHandler", category=PTBUserWarning)
 
-# Dialog states
-AGE, INCOME, HOME, EMP_LENGTH, INTENT, GRADE, LOAN_AMOUNT, LOAN_RATE, PREDICT = range(9)
+(AGE, INCOME, HOME, EMP_LENGTH, CRED_HIST, DEFAULT, INTENT, GRADE,
+ LOAN_AMOUNT, LOAN_RATE, PREDICT) = range(11)
+ORDER = [AGE, INCOME, HOME, EMP_LENGTH, CRED_HIST, DEFAULT, INTENT, GRADE, LOAN_AMOUNT, LOAN_RATE]
 
-# Dictionary to store user data
-user_data = {}
+HOME_LABELS = {'RENT': 'Аренда', 'OWN': 'Собственное жильё', 'MORTGAGE': 'Ипотека', 'OTHER': 'Другое'}
+INTENT_LABELS = {
+    'PERSONAL': 'Личные нужды', 'EDUCATION': 'Образование', 'MEDICAL': 'Лечение',
+    'VENTURE': 'Бизнес', 'HOMEIMPROVEMENT': 'Ремонт жилья', 'DEBTCONSOLIDATION': 'Погашение других долгов',
+}
+GRADE_LABELS = {g: g for g in LOAN_GRADE} | {'A': 'A (низкий риск)', 'G': 'G (высокий риск)'}
+DEFAULT_LABELS = {'N': 'Нет', 'Y': 'Да'}
 
-# Dictionaries for encoding categorical variables
-HOMES = {'RENT': 0, 'OWN': 1, 'MORTGAGE': 2, 'OTHER': 3}
-INTENTS = {'PERSONAL': 0, 'EDUCATION': 1, 'MEDICAL': 2, 'VENTURE': 3, 'HOME_IMPROVEMENT': 4, 'DEBT_CONSOLIDATION': 5}
-GRADES = {'A': 0, 'B': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6}
 
-def load_model():
-    """Loads the trained model"""
+def keyboard(prefix: str, options: list[str], labels: dict, per_row: int = 1) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(labels[o], callback_data=f'{prefix}:{o}') for o in options]
+    return InlineKeyboardMarkup([buttons[i:i + per_row] for i in range(0, len(buttons), per_row)])
+
+
+PROMPTS = {
+    AGE: ('🎂 Сколько вам лет?', None),
+    INCOME: ('💵 Ваш годовой доход (в долларах)?', None),
+    HOME: ('🏠 Какой у вас тип жилья?', keyboard('home', HOME_OWNERSHIP, HOME_LABELS)),
+    EMP_LENGTH: ('💼 Сколько лет вы работаете на текущем месте? (можно 0)', None),
+    CRED_HIST: ('📅 Сколько лет вашей кредитной истории?', None),
+    DEFAULT: ('⚠️ Были ли у вас раньше просрочки или дефолты по кредитам?',
+              keyboard('default', DEFAULT_ON_FILE, DEFAULT_LABELS, per_row=2)),
+    INTENT: ('🎯 Цель кредита?', keyboard('intent', LOAN_INTENT, INTENT_LABELS)),
+    GRADE: ('📊 Кредитный грейд (A — лучший, G — худший):', keyboard('grade', LOAN_GRADE, GRADE_LABELS, per_row=2)),
+    LOAN_AMOUNT: ('💰 Какую сумму кредита вы хотите получить (в долларах)?', None),
+    LOAN_RATE: ('📈 Процентная ставка по кредиту, % (например, 8.5):', None),
+}
+
+# state -> (feature, min, max, integer)
+NUMBER_FIELDS = {
+    AGE: ('person_age', 18, 100, True),
+    INCOME: ('person_income', 1_000, 10_000_000, True),
+    EMP_LENGTH: ('person_emp_length', 0, 60, False),
+    CRED_HIST: ('cb_person_cred_hist_length', 0, 60, True),
+    LOAN_AMOUNT: ('loan_amnt', 100, 1_000_000, True),
+    LOAN_RATE: ('loan_int_rate', 0, 50, False),
+}
+
+# state -> (feature, callback prefix, labels)
+CHOICE_FIELDS = {
+    HOME: ('person_home_ownership', 'home', HOME_LABELS),
+    DEFAULT: ('cb_person_default_on_file', 'default', DEFAULT_LABELS),
+    INTENT: ('loan_intent', 'intent', INTENT_LABELS),
+    GRADE: ('loan_grade', 'grade', GRADE_LABELS),
+}
+
+RESTART_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton('🔄 Новая заявка', callback_data='restart'),
+    InlineKeyboardButton('👋 Выход', callback_data='exit'),
+]])
+
+THOUSANDS = re.compile(r'^\d{1,3}(,\d{3})+(\.\d+)?$')
+
+
+def parse_number(text: str) -> float | None:
+    """Accepts '50000', '50 000', '50,000', '$50000', '8,5', '8.5%'."""
+    s = re.sub(r'[\s_]', '', text).lstrip('$').rstrip('%')
+    s = s.replace(',', '') if THOUSANDS.match(s) else s.replace(',', '.')
     try:
-        with open('credit_model.pkl', 'rb') as f:
-            model_data = pickle.load(f)
-        return model_data
-    except FileNotFoundError:
-        logger.error("File credit_model.pkl not found. Please run train_model.py first")
+        value = float(s)
+    except ValueError:
         return None
+    return value if math.isfinite(value) else None
 
-# Load model on startup
-MODEL_DATA = load_model()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start bot and begin dialog"""
-    user_id = update.effective_user.id
-    user_data[user_id] = {}
-    
-    message = """🏦 Welcome to Credit Approval Prediction Bot!
+def money(value: float) -> str:
+    return f'${value:,.0f}'.replace(',', ' ')
 
-I'll help you find out the probability of getting a loan based on logistic regression.
 
-Let's get started! 📋
+async def ask(message: Message, state: int) -> int:
+    text, markup = PROMPTS[state]
+    await message.reply_text(text, reply_markup=markup)
+    return state
 
-How old are you?"""
-    
-    await update.message.reply_text(message)
-    return AGE
 
-async def get_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get age"""
-    user_id = update.effective_user.id
-    try:
-        age = int(update.message.text)
-        if age < 18 or age > 120:
-            await update.message.reply_text("⚠️ Age must be between 18 and 120 years old. Try again:")
-            return AGE
-        user_data[user_id]['age'] = age
-        
-        await update.message.reply_text("✅ Thank you! Now enter your annual income (in dollars):")
-        return INCOME
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number:")
-        return AGE
+async def advance(message: Message, context: ContextTypes.DEFAULT_TYPE, state: int) -> int:
+    idx = ORDER.index(state)
+    if idx + 1 < len(ORDER):
+        return await ask(message, ORDER[idx + 1])
+    return await send_prediction(message, context)
 
-async def get_income(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get income"""
-    user_id = update.effective_user.id
-    try:
-        income = int(update.message.text)
-        if income < 0:
-            await update.message.reply_text("⚠️ Income cannot be negative. Try again:")
-            return INCOME
-        user_data[user_id]['income'] = income
-        
-        # Create buttons for housing type selection
-        keyboard = [
-            [InlineKeyboardButton("Rent (RENT)", callback_data='home_RENT')],
-            [InlineKeyboardButton("Own (OWN)", callback_data='home_OWN')],
-            [InlineKeyboardButton("Mortgage (MORTGAGE)", callback_data='home_MORTGAGE')],
-            [InlineKeyboardButton("Other (OTHER)", callback_data='home_OTHER')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("🏠 What is your housing type?", reply_markup=reply_markup)
-        return HOME
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number:")
-        return INCOME
 
-async def get_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get housing type"""
-    user_id = update.effective_user.id
+def number_handler(state: int):
+    key, lo, hi, integer = NUMBER_FIELDS[state]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        value = parse_number(update.message.text)
+        if value is None or not lo <= value <= hi:
+            await update.message.reply_text(f'❌ Введите число от {lo:,} до {hi:,}:'.replace(',', ' '))
+            return state
+        context.user_data['answers'][key] = int(round(value)) if integer else value
+        return await advance(update.message, context, state)
+
+    return handler
+
+
+def choice_handler(state: int):
+    key, _, labels = CHOICE_FIELDS[state]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        value = query.data.split(':', 1)[1]
+        context.user_data['answers'][key] = value
+        await query.edit_message_text(f'{PROMPTS[state][0]}\n✅ {labels[value]}')
+        return await advance(query.message, context, state)
+
+    return handler
+
+
+def format_result(answers: dict, risk: float, approved: bool, threshold: float) -> str:
+    verdict = ('✅ КРЕДИТ, СКОРЕЕ ВСЕГО, ОДОБРЯТ' if approved
+               else '❌ ВЫСОКИЙ РИСК — КРЕДИТ, СКОРЕЕ ВСЕГО, НЕ ОДОБРЯТ')
+    a = answers
+    return f"""{verdict}
+
+📊 Оценка риска невозврата: {risk:.1%}
+(заявка одобряется, если риск ниже {threshold:.0%})
+
+📋 Ваши данные:
+• Возраст: {a['person_age']}
+• Годовой доход: {money(a['person_income'])}
+• Жильё: {HOME_LABELS[a['person_home_ownership']]}
+• Стаж на текущем месте, лет: {a['person_emp_length']:g}
+• Кредитная история, лет: {a['cb_person_cred_hist_length']}
+• Просрочки в прошлом: {DEFAULT_LABELS[a['cb_person_default_on_file']]}
+• Цель: {INTENT_LABELS[a['loan_intent']]}
+• Грейд: {a['loan_grade']}
+• Сумма кредита: {money(a['loan_amnt'])}
+• Ставка: {a['loan_int_rate']:g}%
+• Сумма / доход: {a['loan_amnt'] / a['person_income']:.0%}
+
+ℹ️ Это прогноз учебной модели, а не решение банка."""
+
+
+async def send_prediction(message: Message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    model_data = context.bot_data['model']
+    answers = context.user_data['answers']
+    risk, approved = predict_risk(model_data, answers)
+    logger.info('Prediction: risk=%.3f approved=%s', risk, approved)
+    await message.reply_text(
+        format_result(answers, risk, approved, model_data['threshold']), reply_markup=RESTART_KEYBOARD
+    )
+    return PREDICT
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['answers'] = {}
+    await update.message.reply_text(
+        '🏦 Добро пожаловать в бот прогноза одобрения кредита!\n\n'
+        'Я задам 10 вопросов и оценю ваши шансы с помощью модели логистической регрессии.\n'
+        'Отменить анкету можно командой /cancel.'
+    )
+    return await ask(update.message, AGE)
+
+
+async def restart_or_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    
-    home_type = query.data.split('_')[1]
-    user_data[user_id]['home'] = HOMES[home_type]
-    
-    await query.edit_message_text("✅ Thank you!\n\nHow many years have you been working? (enter a number, can be 0):")
-    return EMP_LENGTH
-
-async def get_emp_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get employment length"""
-    user_id = update.effective_user.id
-    try:
-        emp_length = float(update.message.text)
-        if emp_length < 0 or emp_length > 100:
-            await update.message.reply_text("⚠️ Employment length must be between 0 and 100 years. Try again:")
-            return EMP_LENGTH
-        user_data[user_id]['emp_length'] = emp_length
-        
-        # Buttons for loan purpose selection
-        keyboard = [
-            [InlineKeyboardButton("Personal (PERSONAL)", callback_data='intent_PERSONAL')],
-            [InlineKeyboardButton("Education (EDUCATION)", callback_data='intent_EDUCATION')],
-            [InlineKeyboardButton("Medical (MEDICAL)", callback_data='intent_MEDICAL')],
-            [InlineKeyboardButton("Venture (VENTURE)", callback_data='intent_VENTURE')],
-            [InlineKeyboardButton("Home Improvement (HOME_IMPROVEMENT)", callback_data='intent_HOME_IMPROVEMENT')],
-            [InlineKeyboardButton("Debt Consolidation (DEBT_CONSOLIDATION)", callback_data='intent_DEBT_CONSOLIDATION')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text("💡 What is the purpose of your loan?", reply_markup=reply_markup)
-        return INTENT
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number:")
-        return EMP_LENGTH
-
-async def get_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get loan purpose"""
-    user_id = update.effective_user.id
-    query = update.callback_query
-    await query.answer()
-    
-    intent = query.data.split('_', 1)[1]
-    user_data[user_id]['intent'] = INTENTS[intent]
-    
-    # Buttons for loan grade selection
-    keyboard = [
-        [InlineKeyboardButton("A (Low Risk)", callback_data='grade_A'), InlineKeyboardButton("B", callback_data='grade_B')],
-        [InlineKeyboardButton("C", callback_data='grade_C'), InlineKeyboardButton("D", callback_data='grade_D')],
-        [InlineKeyboardButton("E", callback_data='grade_E'), InlineKeyboardButton("F", callback_data='grade_F')],
-        [InlineKeyboardButton("G (High Risk)", callback_data='grade_G')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text("📈 Select loan grade (A - best, G - worst):", reply_markup=reply_markup)
-    return GRADE
-
-async def get_grade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get loan grade"""
-    user_id = update.effective_user.id
-    query = update.callback_query
-    await query.answer()
-    
-    grade = query.data.split('_')[1]
-    user_data[user_id]['grade'] = GRADES[grade]
-    
-    await query.edit_message_text("💰 What loan amount are you requesting? (in dollars)")
-    return LOAN_AMOUNT
-
-async def get_loan_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get loan amount"""
-    user_id = update.effective_user.id
-    try:
-        loan_amount = int(update.message.text)
-        if loan_amount <= 0 or loan_amount > 1000000:
-            await update.message.reply_text("⚠️ Amount must be between 1 and 1,000,000 dollars. Try again:")
-            return LOAN_AMOUNT
-        user_data[user_id]['loan_amount'] = loan_amount
-        
-        await update.message.reply_text("📈 Enter interest rate (example: 8.5):")
-        return LOAN_RATE
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number:")
-        return LOAN_AMOUNT
-
-async def get_loan_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получаем процентную ставку и делаем прогноз"""
-    user_id = update.effective_user.id
-    try:
-        loan_rate = float(update.message.text)
-        if loan_rate < 0 or loan_rate > 50:
-            await update.message.reply_text("⚠️ Ставка должна быть от 0 до 50%. Попробуйте ещё раз:")
-            return LOAN_RATE
-        user_data[user_id]['loan_rate'] = loan_rate
-        
-        # Calculate loan_percent_income
-        income = user_data[user_id]['income']
-        loan_amount = user_data[user_id]['loan_amount']
-        loan_percent_income = loan_amount / income if income > 0 else 0
-        
-        # Prepare data for model
-        user_features = {
-            'person_age': user_data[user_id]['age'],
-            'person_income': user_data[user_id]['income'],
-            'person_home_ownership': user_data[user_id]['home'],
-            'person_emp_length': user_data[user_id]['emp_length'],
-            'loan_intent': user_data[user_id]['intent'],
-            'loan_grade': user_data[user_id]['grade'],
-            'loan_amnt': user_data[user_id]['loan_amount'],
-            'loan_int_rate': user_data[user_id]['loan_rate'],
-            'loan_percent_income': loan_percent_income,
-            'cb_person_default_on_file': 0,  # Assume no defaults
-            'cb_person_cred_hist_length': 5  # Average value
-        }
-        
-        # Make prediction
-        if MODEL_DATA is None:
-            await update.message.reply_text("❌ Error: Model not loaded. Please contact administrator.")
-            return ConversationHandler.END
-        
-        model = MODEL_DATA['model']
-        scaler = MODEL_DATA['scaler']
-        feature_names = MODEL_DATA['feature_names']
-        
-        # Create DataFrame with correct feature order
-        X = pd.DataFrame([user_features])[feature_names]
-        X_scaled = scaler.transform(X)
-        
-        # Get prediction and probability
-        prediction = model.predict(X_scaled)[0]
-        probability = model.predict_proba(X_scaled)[0]
-        
-        # Format response
-        if prediction == 1:
-            result = "✅ CREDIT APPROVED!"
-            probability_pct = probability[1] * 100
-            message = f"""{result}
-
-📊 Prediction Result:
-Approval Probability: {probability_pct:.1f}%
-
-📋 Your Parameters:
-• Age: {user_data[user_id]['age']} years
-• Income: ${user_data[user_id]['income']:,}
-• Loan Amount: ${user_data[user_id]['loan_amount']:,}
-• Interest Rate: {user_data[user_id]['loan_rate']}%
-• Loan-to-Income Ratio: {loan_percent_income:.2%}
-
-✨ Congratulations! Based on the model analysis, your application has strong chances of approval."""
-        else:
-            result = "❌ CREDIT REJECTED"
-            probability_pct = probability[0] * 100
-            message = f"""{result}
-
-📊 Prediction Result:
-Rejection Probability: {probability_pct:.1f}%
-
-📋 Your Parameters:
-• Age: {user_data[user_id]['age']} years
-• Income: ${user_data[user_id]['income']:,}
-• Loan Amount: ${user_data[user_id]['loan_amount']:,}
-• Interest Rate: {user_data[user_id]['loan_rate']}%
-• Loan-to-Income Ratio: {loan_percent_income:.2%}
-
-⚠️ Unfortunately, according to the model prediction, your application does not meet the approval criteria.
-We recommend contacting the bank branch for personal consultation."""
-        
-        await update.message.reply_text(message)
-        
-        # Offer to start over
-        keyboard = [
-            [InlineKeyboardButton("New Application", callback_data='restart')],
-            [InlineKeyboardButton("Exit", callback_data='exit')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("\nWhat would you like to do?", reply_markup=reply_markup)
-        
-        return PREDICT
-        
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a number:")
-        return LOAN_RATE
-
-async def restart_or_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Restart or exit"""
-    user_id = update.effective_user.id
-    query = update.callback_query
-    await query.answer()
-    
+    await query.edit_message_reply_markup(reply_markup=None)
     if query.data == 'restart':
-        user_data[user_id] = {}
-        await query.edit_message_text("🔄 Starting new application...\\n\\nHow old are you?")
-        return AGE
-    else:
-        await query.edit_message_text("👋 Thank you for using the bot! Goodbye!")
-        return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel dialog"""
-    await update.message.reply_text("❌ Dialog cancelled. Enter /start to begin.")
+        context.user_data['answers'] = {}
+        await query.message.reply_text('🔄 Начинаем новую заявку.')
+        return await ask(query.message, AGE)
+    await query.message.reply_text('👋 Спасибо, что воспользовались ботом! Чтобы начать заново — /start')
     return ConversationHandler.END
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help"""
-    help_text = """📖 Bot Help
 
-This bot helps predict the probability of loan approval based on logistic regression.
+async def use_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text('👆 Пожалуйста, выберите вариант кнопкой выше.')
 
-🔄 Commands:
-/start - Start a new application
-/help - Show this help
-/cancel - Cancel current application
 
-📝 Process:
-1. Enter your information (age, income, housing type, etc.)
-2. The bot will process the information using a machine learning model
-3. Get the prediction result with approval probability
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop('answers', None)
+    await update.message.reply_text('❌ Анкета отменена. Чтобы начать заново — /start')
+    return ConversationHandler.END
 
-⚙️ The model is trained on real credit approval data."""
-    
-    await update.message.reply_text(help_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        '📖 Помощь\n\n'
+        'Бот оценивает риск невозврата кредита с помощью логистической регрессии, '
+        'обученной на данных о кредитных заявках.\n\n'
+        '🔄 Команды:\n'
+        '/start — новая заявка\n'
+        '/cancel — отменить текущую заявку\n'
+        '/help — эта справка'
+    )
+
+
+def build_application(token: str, model_data: dict) -> Application:
+    application = Application.builder().token(token).build()
+    application.bot_data['model'] = model_data
+
+    text = filters.TEXT & ~filters.COMMAND
+    states = {s: [MessageHandler(text, number_handler(s))] for s in NUMBER_FIELDS}
+    states |= {s: [CallbackQueryHandler(choice_handler(s), pattern=f'^{prefix}:')]
+               for s, (_, prefix, _) in CHOICE_FIELDS.items()}
+    states[PREDICT] = [CallbackQueryHandler(restart_or_exit, pattern='^(restart|exit)$')]
+
+    application.add_handler(ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states=states,
+        fallbacks=[CommandHandler('cancel', cancel), MessageHandler(text, use_buttons)],
+        allow_reentry=True,
+    ))
+    application.add_handler(CommandHandler('help', help_command))
+    return application
+
 
 def main():
-    """Main function to run the bot"""
-    # Get token from environment variable or .env file
-    from dotenv import load_dotenv
-    import os
-    
     load_dotenv()
-    TOKEN = os.getenv('TELEGRAM_TOKEN')
-    
-    if not TOKEN or TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("\n⚠️ ERROR: TELEGRAM_TOKEN not set!")
-        print("Please set your token in the .env file or as an environment variable.")
-        print("See .env.example for details.")
-        logger.error("TELEGRAM_TOKEN not configured")
+    token = os.getenv('TELEGRAM_TOKEN')
+    if not token or token.startswith('your_token_here'):
+        logger.error('TELEGRAM_TOKEN не задан. Укажите его в .env (см. .env.example) или в переменной окружения.')
         return
-    
-    # Create application
-    application = Application.builder().token(TOKEN).build()
-    
-    # Create conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_age)],
-            INCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_income)],
-            HOME: [CallbackQueryHandler(get_home, pattern='^home_')],
-            EMP_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_emp_length)],
-            INTENT: [CallbackQueryHandler(get_intent, pattern='^intent_')],
-            GRADE: [CallbackQueryHandler(get_grade, pattern='^grade_')],
-            LOAN_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_loan_amount)],
-            LOAN_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_loan_rate)],
-            PREDICT: [CallbackQueryHandler(restart_or_exit, pattern='^(restart|exit)')],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        allow_reentry=True
-    )
-    
-    # Add handlers
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('start', start))
-    
-    # Run the bot
-    print("🚀 Bot started!")
+
+    try:
+        model_data = load_model()
+    except FileNotFoundError:
+        logger.error('Файл %s не найден. Сначала запустите: python train_model.py', MODEL_PATH)
+        return
+
+    application = build_application(token, model_data)
+    logger.info('🚀 Бот запущен')
     application.run_polling()
+
 
 if __name__ == '__main__':
     main()

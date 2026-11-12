@@ -1,227 +1,134 @@
 # Telegram Bot for Credit Approval Prediction 🏦
 
-A Telegram bot that uses logistic regression to predict the probability of loan approval.
+A Telegram bot (Russian-language interface) that uses logistic regression to estimate the default risk of a loan application and predict whether it will be approved.
 
 ## What is this?
 
-The bot analyzes customer data (age, income, housing type, loan purpose, etc.) and based on a trained machine learning model, predicts whether a credit application will be approved or rejected.
+The bot asks the client 10 questions (age, income, housing, credit history, loan purpose, etc.), runs the answers through a trained scikit-learn pipeline and returns the estimated **risk of default**. An application is considered approved when the risk is below the model's decision threshold.
+
+> In the dataset `loan_status = 1` means **high risk / default** (its rate grows from 5% for grade A to 82% for grade G), so the approval decision is `P(loan_status = 1) < threshold`.
 
 ## Requirements 📋
 
-- Python 3.8+
-- pip
+- Python 3.10+
 - Telegram bot token
 
 ## Installation 🚀
-
-### 1. Clone/download the repository
-
-```bash
-cd /path/to/project
-```
-
-### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Get a token for your bot
-
-1. Open Telegram and find **@BotFather**
-2. Send the `/newbot` command
-3. Follow the instructions
-4. Copy your token (looks like: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
-
-### 4. Train the model
-
-First, train the model and save it:
+### 1. Train the model
 
 ```bash
 python train_model.py
 ```
 
-This script:
-- Loads data from `train.csv`
-- Trains logistic regression
-- Saves the model to `credit_model.pkl`
-- Outputs metrics on the validation set
+This script loads `train.csv`, trains the pipeline on an 80/20 split, picks the decision threshold that maximizes F1 on the validation set, refits on all data and saves everything to `credit_model.pkl`.
 
 **Expected output:**
 ```
-Validation Results:
+Validation Results (threshold = 0.34):
 ==================================================
-Accuracy:  0.8995
-Precision: 0.7576
-Recall:    0.4323
-F1-Score:  0.5505
-ROC-AUC:   0.8833
+accuracy   0.9135
+precision  0.6966
+recall     0.6958
+f1         0.6962
+roc_auc    0.9102
 ==================================================
 
 Model saved to credit_model.pkl
 ```
 
-### 5. Run the bot
+### 2. Set the token
+
+Get a token from **@BotFather** (`/newbot`), then:
 
 ```bash
-python bot.py
-```
-
-**Before the first run**, create a `.env` file with your token:
-
-```bash
-# Copy the example file
 cp .env.example .env
-
-# Edit .env and add your token
-# TELEGRAM_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+# edit .env: TELEGRAM_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
 
-Or set the environment variable directly:
+or `export TELEGRAM_TOKEN="..."`.
+
+### 3. Run the bot
 
 ```bash
-export TELEGRAM_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 python bot.py
 ```
 
-## Usage 💬
-
-1. Open Telegram and find your bot
-2. Press `/start`
-3. Follow the bot's instructions
-4. Enter your information
-5. Get your prediction! ✨
+Open your bot in Telegram and press `/start`.
 
 ## Bot Parameters 🎯
 
-The bot collects the following information:
+| Parameter | Model feature | Input |
+|-----------|---------------|-------|
+| Age | `person_age` | number, 18–100 |
+| Annual income, $ | `person_income` | number (`50000`, `50 000`, `50,000` are all accepted) |
+| Housing | `person_home_ownership` | button: RENT / OWN / MORTGAGE / OTHER |
+| Years at current job | `person_emp_length` | number |
+| Credit history length, years | `cb_person_cred_hist_length` | number |
+| Previous default | `cb_person_default_on_file` | button: Y / N |
+| Loan purpose | `loan_intent` | button |
+| Loan grade | `loan_grade` | button: A–G |
+| Loan amount, $ | `loan_amnt` | number |
+| Interest rate, % | `loan_int_rate` | number (`8.5` or `8,5`) |
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| **Age** | Your age in years | 35 |
-| **Income** | Annual income in dollars | 50000 |
-| **Housing Type** | RENT, OWN, MORTGAGE, OTHER | RENT |
-| **Employment Length** | Years at current job | 5 |
-| **Loan Purpose** | PERSONAL, EDUCATION, MEDICAL, VENTURE, HOME_IMPROVEMENT, DEBT_CONSOLIDATION | EDUCATION |
-| **Loan Grade** | A-G (A best, G worst) | B |
-| **Loan Amount** | Requested amount in $ | 10000 |
-| **Interest Rate** | Rate in % | 8.5 |
+`loan_percent_income` is computed from amount and income.
 
 ## File Structure 📁
 
 ```
-playground-series-s4e10/
-├── train.csv                    # Training data
-├── test.csv                     # Test data
-├── sample_submission.csv        # Example results
-├── credit_prediction.ipynb      # Jupyter notebook with analysis
-├── train_model.py              # Model training script
-├── bot.py                      # Telegram bot
-├── credit_model.pkl            # Saved model (created after train_model.py)
-├── requirements.txt            # Python dependencies
-└── README.md                   # This file
+├── model.py                  # Features, categories and the sklearn pipeline (shared code)
+├── train_model.py            # Training, threshold selection, saving credit_model.pkl
+├── bot.py                    # Telegram bot
+├── credit_prediction.ipynb   # Analysis notebook + Kaggle submission
+├── tests/                    # pytest tests for the model and the bot dialog
+├── train.csv / test.csv      # Data (Kaggle Playground Series S4E10)
+├── requirements.txt
+└── requirements-dev.txt
 ```
 
 ## How it Works ⚙️
 
-### Model Training (`train_model.py`)
-
 ```
-train.csv → Data Preprocessing → Normalization → Logistic Regression → credit_model.pkl
+raw answers → add_features → OneHotEncoder + StandardScaler → LogisticRegression → P(default) → threshold
 ```
 
-1. **Preprocessing:**
-   - Fill missing values
-   - Encode categorical variables
-
-2. **Normalization:**
-   - StandardScaler for feature scaling
-
-3. **Training:**
-   - Logistic regression with max_iter=1000
-   - 80% training / 20% validation split
-
-### Prediction in Bot (`bot.py`)
-
-```
-User Input → Data Preparation → Normalization → 
-Logistic Regression → Probability → Result
-```
+- **Feature engineering:** `log(income)`, `log(loan amount)`, exact loan-to-income ratio.
+- **Encoding:** one-hot for housing, purpose and grade (the risk is not linear across grades: D is much riskier than C); binary for previous default.
+- **One pipeline object** is saved, so the bot passes raw values (`'RENT'`, `'Y'`) and encoding can never drift between training and inference.
+- **Threshold** is tuned on validation (default 0.5 gave recall of only ~46%).
 
 ## Model Results 📊
 
-On the validation set:
-- **Accuracy:** ~90%
-- **ROC-AUC:** ~0.88
-- **Precision:** ~76% 
-- **Recall:** ~43%
+| | Before | Now |
+|---|---|---|
+| ROC-AUC | 0.883 | **0.910** |
+| F1 | 0.551 | **0.696** |
+| Recall (high-risk class) | 0.432 | **0.696** |
+| Precision | 0.758 | 0.697 |
+
+## Tests 🧪
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests check that the categories match the data, that predictions are sane for low/high-risk profiles, number parsing, and walk through the full bot dialog.
 
 ## Troubleshooting 🔧
 
-### Error: "credit_model.pkl not found"
-
-**Solution:** Run `python train_model.py` first
-
-### Error: "TOKEN not set"
-
-**Solution:** Replace `TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"` with your actual token
-
-### Bot is not responding
-
-**Solution:** 
-- Check your internet connection
-- Verify the token is correct
-- Restart the bot
-
-### Import error for libraries
-
-**Solution:** Make sure all dependencies are installed:
-```bash
-pip install -r requirements.txt
-```
-
-## Additional Commands 📝
-
-- `/start` - Start a new application
-- `/help` - Bot help
-- `/cancel` - Cancel current application
+- **`credit_model.pkl` not found** — run `python train_model.py`.
+- **`TELEGRAM_TOKEN` not set** — create `.env` from `.env.example` or export the variable.
+- **Errors loading the model after upgrading scikit-learn** — retrain: pickled models are tied to the library version.
 
 ## Security ⚠️
 
-- **Never commit your `.env` file** to Git (it's in `.gitignore`)
-- **Never publish your token** online
-- Use the `.env` file to store sensitive data:
-
-```bash
-# .env (create this file locally, don't commit)
-TELEGRAM_TOKEN=your_token_here
-```
-
-The bot will automatically load variables from `.env` using `python-dotenv`:
-
-```python
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-```
+Never commit `.env` (it is in `.gitignore`) and never publish your token.
 
 ## License 📄
 
 MIT
-
-## Author ✍️
-
-Created as a machine learning project for credit approval prediction.
-
-## Support & Contact 💬
-
-If you have questions or issues, check:
-1. Are all dependencies installed?
-2. Is the token set correctly?
-3. Has the model been trained (`train_model.py`)?
-
----
-
-**Happy using! 🚀**
