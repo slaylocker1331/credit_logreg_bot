@@ -79,3 +79,16 @@ def test_invalid_number_keeps_state():
     update = SimpleNamespace(message=FakeMessage('150'))
     assert asyncio.run(bot.number_handler(bot.AGE)(update, context)) == bot.AGE
     assert context.user_data['answers'] == {}
+
+
+@pytest.mark.parametrize('state, value, accepted', [
+    (bot.EMP_LENGTH, '6', True), (bot.EMP_LENGTH, '7', False),
+    (bot.CRED_HIST, '4', True), (bot.CRED_HIST, '5', False),
+])
+def test_experience_limited_by_age(state, value, accepted):
+    context = SimpleNamespace(user_data={'answers': {'person_age': 20}}, bot_data={})
+    update = SimpleNamespace(message=FakeMessage(value))
+    next_state = asyncio.run(bot.number_handler(state)(update, context))
+    assert (next_state != state) == accepted
+    if not accepted:
+        assert 'в 20 лет' in update.message.replies[-1]

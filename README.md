@@ -10,7 +10,7 @@ The bot asks the client 10 questions (age, income, housing, credit history, loan
 
 ## Requirements 📋
 
-- Python 3.10+
+- Python 3.9+
 - Telegram bot token
 
 ## Installation 🚀
@@ -67,8 +67,8 @@ Open your bot in Telegram and press `/start`.
 | Age | `person_age` | number, 18–100 |
 | Annual income, $ | `person_income` | number (`50000`, `50 000`, `50,000` are all accepted) |
 | Housing | `person_home_ownership` | button: RENT / OWN / MORTGAGE / OTHER |
-| Years at current job | `person_emp_length` | number |
-| Credit history length, years | `cb_person_cred_hist_length` | number |
+| Years at current job | `person_emp_length` | number, at most age − 14 |
+| Credit history length, years | `cb_person_cred_hist_length` | number, at most age − 16 |
 | Previous default | `cb_person_default_on_file` | button: Y / N |
 | Loan purpose | `loan_intent` | button |
 | Loan grade | `loan_grade` | button: A–G |
@@ -122,6 +122,7 @@ Tests check that the categories match the data, that predictions are sane for lo
 ## Troubleshooting 🔧
 
 - **`credit_model.pkl` not found** — run `python train_model.py`.
+- **`credit_model.pkl` is from an old version / fails to load** — the bot refuses to start; retrain with `python train_model.py`.
 - **`TELEGRAM_TOKEN` not set** — create `.env` from `.env.example` or export the variable.
 - **Errors loading the model after upgrading scikit-learn** — retrain: pickled models are tied to the library version.
 

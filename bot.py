@@ -1,6 +1,8 @@
 """
 Telegram-бот для прогноза одобрения кредита на основе логистической регрессии
 """
+from __future__ import annotations  # `float | None` annotations on Python 3.9
+
 import logging
 import math
 import os
@@ -66,6 +68,12 @@ NUMBER_FIELDS = {
     LOAN_RATE: ('loan_int_rate', 0, 50, False),
 }
 
+# state -> minimum age at which counting starts: you can't have worked or had credit before it
+AGE_LIMITED = {
+    EMP_LENGTH: 14,
+    CRED_HIST: 16,
+}
+
 # state -> (feature, callback prefix, labels)
 CHOICE_FIELDS = {
     HOME: ('person_home_ownership', 'home', HOME_LABELS),
@@ -114,11 +122,18 @@ def number_handler(state: int):
     key, lo, hi, integer = NUMBER_FIELDS[state]
 
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        answers = context.user_data['answers']
+        upper = hi
+        if state in AGE_LIMITED:
+            upper = min(hi, max(0, answers['person_age'] - AGE_LIMITED[state]))
         value = parse_number(update.message.text)
-        if value is None or not lo <= value <= hi:
-            await update.message.reply_text(f'❌ Введите число от {lo:,} до {hi:,}:'.replace(',', ' '))
+        if value is None or not lo <= value <= upper:
+            error = f'❌ Введите число от {lo:,} до {upper:,}'.replace(',', ' ')
+            if upper < hi:
+                error += f' (в {answers["person_age"]} лет больше быть не может)'
+            await update.message.reply_text(error + ':')
             return state
-        context.user_data['answers'][key] = int(round(value)) if integer else value
+        answers[key] = int(round(value)) if integer else value
         return await advance(update.message, context, state)
 
     return handler
@@ -235,7 +250,14 @@ def build_application(token: str, model_data: dict) -> Application:
         allow_reentry=True,
     ))
     application.add_handler(CommandHandler('help', help_command))
+    application.add_error_handler(error_handler)
     return application
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error('Ошибка при обработке апдейта', exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text('⚠️ Что-то пошло не так. Начните заново: /start')
 
 
 def main():
@@ -249,6 +271,12 @@ def main():
         model_data = load_model()
     except FileNotFoundError:
         logger.error('Файл %s не найден. Сначала запустите: python train_model.py', MODEL_PATH)
+        return
+    except Exception:
+        logger.exception('Не удалось загрузить %s. Переобучите модель: python train_model.py', MODEL_PATH)
+        return
+    if not isinstance(model_data, dict) or not {'pipeline', 'threshold'} <= model_data.keys():
+        logger.error('%s создан старой версией проекта. Переобучите модель: python train_model.py', MODEL_PATH)
         return
 
     application = build_application(token, model_data)
