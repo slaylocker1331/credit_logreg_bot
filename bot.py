@@ -10,13 +10,17 @@ import re
 import warnings
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup,
+    ReplyKeyboardRemove, Update, User,
+)
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler,
-    MessageHandler, filters,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters,
 )
 from telegram.warnings import PTBUserWarning
 
+from db import DB_PATH, Database
 from model import (
     DEFAULT_ON_FILE, HOME_OWNERSHIP, LOAN_GRADE, LOAN_INTENT, MODEL_PATH, load_model, predict_risk,
 )
@@ -87,6 +91,12 @@ RESTART_KEYBOARD = InlineKeyboardMarkup([[
     InlineKeyboardButton('👋 Выход', callback_data='exit'),
 ]])
 
+SKIP_PHONE = '⏭ Пропустить'
+PHONE_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton('📱 Поделиться номером', request_contact=True)], [SKIP_PHONE]],
+    resize_keyboard=True, one_time_keyboard=True,
+)
+
 THOUSANDS = re.compile(r'^\d{1,3}(,\d{3})+(\.\d+)?$')
 
 
@@ -111,11 +121,11 @@ async def ask(message: Message, state: int) -> int:
     return state
 
 
-async def advance(message: Message, context: ContextTypes.DEFAULT_TYPE, state: int) -> int:
+async def advance(message: Message, context: ContextTypes.DEFAULT_TYPE, state: int, user: User | None) -> int:
     idx = ORDER.index(state)
     if idx + 1 < len(ORDER):
         return await ask(message, ORDER[idx + 1])
-    return await send_prediction(message, context)
+    return await send_prediction(message, context, user)
 
 
 def number_handler(state: int):
@@ -134,7 +144,7 @@ def number_handler(state: int):
             await update.message.reply_text(error + ':')
             return state
         answers[key] = int(round(value)) if integer else value
-        return await advance(update.message, context, state)
+        return await advance(update.message, context, state, update.effective_user)
 
     return handler
 
@@ -148,7 +158,7 @@ def choice_handler(state: int):
         value = query.data.split(':', 1)[1]
         context.user_data['answers'][key] = value
         await query.edit_message_text(f'{PROMPTS[state][0]}\n✅ {labels[value]}')
-        return await advance(query.message, context, state)
+        return await advance(query.message, context, state, update.effective_user)
 
     return handler
 
@@ -178,7 +188,7 @@ def format_result(answers: dict, risk: float, approved: bool, threshold: float) 
 ℹ️ Это прогноз учебной модели, а не решение банка."""
 
 
-async def send_prediction(message: Message, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def send_prediction(message: Message, context: ContextTypes.DEFAULT_TYPE, user: User | None) -> int:
     model_data = context.bot_data['model']
     answers = context.user_data['answers']
     risk, approved = predict_risk(model_data, answers)
@@ -186,7 +196,40 @@ async def send_prediction(message: Message, context: ContextTypes.DEFAULT_TYPE) 
     await message.reply_text(
         format_result(answers, risk, approved, model_data['threshold']), reply_markup=RESTART_KEYBOARD
     )
+
+    db: Database | None = context.bot_data.get('db')
+    if db is not None and user is not None:
+        try:
+            db.save_application(user, answers, risk, approved, model_data['threshold'])
+            has_phone = db.get_user(user.id)['phone']
+        except Exception:
+            logger.exception('Не удалось сохранить заявку в базу')
+        else:
+            if not has_phone:
+                await message.reply_text(
+                    '📱 Если хотите, оставьте номер телефона — кнопкой ниже (по желанию).',
+                    reply_markup=PHONE_KEYBOARD,
+                )
     return PREDICT
+
+
+async def save_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    contact = update.message.contact
+    user = update.effective_user
+    # Only accept the sender's own number, not a forwarded contact of someone else
+    if contact.user_id != user.id:
+        await update.message.reply_text('❌ Можно отправить только свой номер — кнопкой «📱 Поделиться номером».')
+        raise ApplicationHandlerStop
+    db: Database | None = context.bot_data.get('db')
+    if db is not None:
+        db.save_phone(user, contact.phone_number)
+    await update.message.reply_text('✅ Спасибо, номер сохранён.', reply_markup=ReplyKeyboardRemove())
+    raise ApplicationHandlerStop
+
+
+async def skip_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text('👌 Хорошо, без номера.', reply_markup=ReplyKeyboardRemove())
+    raise ApplicationHandlerStop
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -194,7 +237,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         '🏦 Добро пожаловать в бот прогноза одобрения кредита!\n\n'
         'Я задам 10 вопросов и оценю ваши шансы с помощью модели логистической регрессии.\n'
-        'Отменить анкету можно командой /cancel.'
+        'Отменить анкету можно командой /cancel.\n\n'
+        'ℹ️ Ваше имя, ссылка на профиль, ответы и результат сохраняются у владельца бота.',
+        reply_markup=ReplyKeyboardRemove(),
     )
     return await ask(update.message, AGE)
 
@@ -205,7 +250,7 @@ async def restart_or_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_reply_markup(reply_markup=None)
     if query.data == 'restart':
         context.user_data['answers'] = {}
-        await query.message.reply_text('🔄 Начинаем новую заявку.')
+        await query.message.reply_text('🔄 Начинаем новую заявку.', reply_markup=ReplyKeyboardRemove())
         return await ask(query.message, AGE)
     await query.message.reply_text('👋 Спасибо, что воспользовались ботом! Чтобы начать заново — /start')
     return ConversationHandler.END
@@ -233,9 +278,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def build_application(token: str, model_data: dict) -> Application:
+def build_application(token: str, model_data: dict, db: Database | None = None) -> Application:
     application = Application.builder().token(token).build()
     application.bot_data['model'] = model_data
+    application.bot_data['db'] = db
+
+    # Phone sharing works at any point; these run first and stop further handling
+    application.add_handler(MessageHandler(filters.CONTACT, save_contact), group=-1)
+    application.add_handler(MessageHandler(filters.Text([SKIP_PHONE]), skip_phone), group=-1)
 
     text = filters.TEXT & ~filters.COMMAND
     states = {s: [MessageHandler(text, number_handler(s))] for s in NUMBER_FIELDS}
@@ -279,9 +329,14 @@ def main():
         logger.error('%s создан старой версией проекта. Переобучите модель: python train_model.py', MODEL_PATH)
         return
 
-    application = build_application(token, model_data)
-    logger.info('🚀 Бот запущен')
-    application.run_polling()
+    db_path = os.getenv('DB_PATH', DB_PATH)
+    db = Database(db_path)
+    application = build_application(token, model_data, db)
+    logger.info('🚀 Бот запущен, база: %s', db_path)
+    try:
+        application.run_polling()
+    finally:
+        db.close()
 
 
 if __name__ == '__main__':

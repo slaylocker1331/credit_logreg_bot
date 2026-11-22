@@ -2,8 +2,10 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from telegram.ext import ApplicationHandlerStop
 
 import bot
+from db import Database
 from model import CATEGORICAL
 from tests.conftest import RISKY, SAFE
 
@@ -50,28 +52,78 @@ class FakeQuery:
         pass
 
 
-def run_form(answers, model_data):
-    context = SimpleNamespace(user_data={'answers': {}}, bot_data={'model': model_data})
+USER = SimpleNamespace(id=42, username='alice', first_name='Alice', last_name=None, language_code='ru')
+
+
+def run_form(answers, model_data, db=None, user=USER):
+    context = SimpleNamespace(user_data={'answers': {}}, bot_data={'model': model_data, 'db': db})
     chat = FakeMessage()
     state = bot.AGE
     for _ in bot.ORDER:
         if state in bot.NUMBER_FIELDS:
             feature = bot.NUMBER_FIELDS[state][0]
-            update = SimpleNamespace(message=FakeMessage(str(answers[feature])))
+            update = SimpleNamespace(message=FakeMessage(str(answers[feature])), effective_user=user)
             update.message.replies = chat.replies
             state = asyncio.run(bot.number_handler(state)(update, context))
         else:
             feature, prefix, _ = bot.CHOICE_FIELDS[state]
-            update = SimpleNamespace(callback_query=FakeQuery(f'{prefix}:{answers[feature]}', chat))
+            update = SimpleNamespace(callback_query=FakeQuery(f'{prefix}:{answers[feature]}', chat),
+                                     effective_user=user)
             state = asyncio.run(bot.choice_handler(state)(update, context))
-    return state, chat.replies[-1]
+    return state, chat.replies
 
 
 @pytest.mark.parametrize('profile, verdict', [(SAFE, 'ОДОБРЯТ'), (RISKY, 'НЕ ОДОБРЯТ')])
 def test_full_conversation(model_data, profile, verdict):
-    state, result = run_form(profile, model_data)
+    state, replies = run_form(profile, model_data)
     assert state == bot.PREDICT
-    assert verdict in result.splitlines()[0]
+    assert verdict in replies[-1].splitlines()[0]
+
+
+def test_application_saved_to_db(model_data, tmp_path):
+    db = Database(str(tmp_path / 'bot.db'))
+    run_form(SAFE, model_data, db)
+    run_form(RISKY, model_data, db)
+
+    user = db.get_user(USER.id)
+    assert user['link'] == 'https://t.me/alice'
+    assert user['first_name'] == 'Alice'
+    assert user['phone'] is None
+
+    apps = db.get_applications(USER.id)
+    assert [a['approved'] for a in apps] == [1, 0]
+    assert apps[0]['loan_grade'] == 'A' and apps[0]['person_income'] == 90_000
+    assert 0 <= apps[1]['risk'] <= 1
+
+
+def test_phone_prompt_only_until_shared(model_data, tmp_path):
+    db = Database(str(tmp_path / 'bot.db'))
+    _, replies = run_form(SAFE, model_data, db)
+    assert 'номер телефона' in replies[-1]
+
+    db.save_phone(USER, '+79990000000')
+    assert db.get_user(USER.id)['phone'] == '+79990000000'
+    _, replies = run_form(SAFE, model_data, db)
+    assert 'ОДОБРЯТ' in replies[-1]  # result is the last message, no phone prompt
+
+
+def test_user_without_username_gets_id_link(tmp_path):
+    db = Database(str(tmp_path / 'bot.db'))
+    db.upsert_user(SimpleNamespace(id=7, username=None, first_name='Bob', last_name='B', language_code=None))
+    assert db.get_user(7)['link'] == 'tg://user?id=7'
+
+
+@pytest.mark.parametrize('contact_user_id, saved', [(USER.id, True), (999, False)])
+def test_only_own_contact_is_saved(tmp_path, contact_user_id, saved):
+    db = Database(str(tmp_path / 'bot.db'))
+    message = FakeMessage()
+    message.contact = SimpleNamespace(user_id=contact_user_id, phone_number='+79990000000')
+    update = SimpleNamespace(message=message, effective_user=USER)
+    context = SimpleNamespace(bot_data={'db': db})
+    with pytest.raises(ApplicationHandlerStop):
+        asyncio.run(bot.save_contact(update, context))
+    user = db.get_user(USER.id)
+    assert (user is not None and user['phone'] == '+79990000000') == saved
 
 
 def test_invalid_number_keeps_state():
@@ -87,7 +139,7 @@ def test_invalid_number_keeps_state():
 ])
 def test_experience_limited_by_age(state, value, accepted):
     context = SimpleNamespace(user_data={'answers': {'person_age': 20}}, bot_data={})
-    update = SimpleNamespace(message=FakeMessage(value))
+    update = SimpleNamespace(message=FakeMessage(value), effective_user=USER)
     next_state = asyncio.run(bot.number_handler(state)(update, context))
     assert (next_state != state) == accepted
     if not accepted:

@@ -60,6 +60,31 @@ python bot.py
 
 Open your bot in Telegram and press `/start`.
 
+### Using make
+
+```bash
+make run      # start the bot (trains the model first if credit_model.pkl is missing or outdated)
+make train    # retrain the model
+make test     # run tests
+make help     # list all targets
+```
+
+By default `make` uses the Python from the `slayer` conda environment; override with `make run CONDA_ENV=myenv` or `make run PYTHON=python3`.
+
+### User database
+
+Every completed application is saved to a local SQLite file `bot_data.db` (created on start; path can be changed with `DB_PATH` in `.env`). It is git-ignored.
+
+- `users` — Telegram id, username, first/last name, profile link (`https://t.me/<username>`, or `tg://user?id=<id>` if there is no username), phone, first/last seen.
+- `applications` — all 10 answers, loan/income ratio, predicted risk, approved flag and the threshold used, with a timestamp.
+
+Telegram never gives bots a user's phone number, even if it is public in their profile. After the result the bot offers an optional **📱 Поделиться номером** button; only the sender's own contact is accepted.
+
+```bash
+make db       # show the last 20 applications
+make export   # save everything to users_export.csv (opens in Excel)
+```
+
 ## Bot Parameters 🎯
 
 | Parameter | Model feature | Input |
@@ -85,7 +110,7 @@ Open your bot in Telegram and press `/start`.
 ├── bot.py                    # Telegram bot
 ├── credit_prediction.ipynb   # Analysis notebook + Kaggle submission
 ├── tests/                    # pytest tests for the model and the bot dialog
-├── train.csv / test.csv      # Data (Kaggle Playground Series S4E10)
+├── train.csv                 # Training data (Kaggle Playground Series S4E10)
 ├── requirements.txt
 └── requirements-dev.txt
 ```

@@ -18,4 +18,6 @@ venv/
 
 # Generated
 credit_model.pkl
+*.db
+users_export.csv
 logregression_submission.csv
